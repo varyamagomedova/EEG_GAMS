@@ -1,0 +1,204 @@
+---
+title: "EEG dgame 2 Data Analysis"
+author: "Varya Magomedova"
+date: "2024-06-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(error = TRUE)
+```
+
+Please set your working directory to be able to run the code
+```{r, eval = FALSE}
+setwd("set the pth to your working folder here")
+```
+```{r load_packages, message = FALSE, warning = FALSE}
+
+library(dplyr)
+library(mgcv)
+library(tidyverse)
+library(itsadug)
+
+```
+This is a file with regions annotation, uncomment if you'd like to reannotate the data
+```
+#source("preprocessing.R")
+```
+# Making up, ordering, relevelling variables
+Load the annotated data
+```{r load_data, warning = FALSE, message = FALSE}
+noun_data <- read.csv("noun_data_annotatedVM.csv", stringsAsFactors = T)
+```
+
+Break a continuous first target fixation variable into categories, as the models show better performance with accounting for it this way.
+As FTF_fact is a continuous variable originally, we need to make it ordered. 
+Relevel the condition as R takes first alphabetic leves as a reference, the real reference is no-conflict
+participant ID's are numbers in the data, bu in fact they are factors
+```{r}
+noun_data$FTF_fact <-as.factor(ifelse(noun_data$FTF<0.5, "<0.5", 
+                                      ifelse(noun_data$FTF>=0.5 & noun_data$FTF<=1,">0.5<1",
+                                             ifelse(noun_data$FTF>1 & noun_data$FTF<1.5, ">1<1.5", ">1.5"))))
+
+noun_data$FTF_fact = factor(noun_data$FTF_fact, ordered =T)
+noun_data$condition = relevel(noun_data$condition, ref="no-conflict")
+noun_data$subject <- as.factor(noun_data$subject)
+noun_data$cond_region_interaction = interaction(noun_data$condition,noun_data$region)
+```
+# PLOTTING DATA
+This is the file with functions I made to plot these data
+```{r}
+source("plotting functions.R")
+```
+First,  plot all the data with averaging by subject and then by region. The c(-5,5) parameter is for the y-axis limits. You can change it to see the data better
+```{r, results = 'hide'}
+data_plot_by_subject <-  plot_avg_by_subject(noun_data, c(-5,5))
+data_plot_by_subject
+```
+Then averaging first by channel and then by region to see the variation. 
+```{r, results = 'hide'}
+data_plot_by_channel <-  plot_avg_by_channel(noun_data, c(-5,5))
+data_plot_by_channel
+```
+Then plot first target fixations (they are given in seconds for some reason)
+```{r, results = 'hide'}
+data_FTF <- plot_FTF(noun_data, c(-5,5))
+data_FTF 
+```
+Split the data into subsets by region and hemisphere. 
+You can select a whole region (both hemispheres) with 'subset', you can also do that with dplyr 'filter', but filter deletes all the NA's without telling you and sometimes fails to filter ou some values, like it was in the FOEMA DATA, two data points are always left there by the 'filter' function, but not by the 'subset' function
+You can also pick one of the unilateral regions from the list of subsets.
+
+```{r}
+subsets_by_region_hemisphere <- split(noun_data, list(noun_data$region, noun_data$hemisphere))
+motor <- droplevels(subset(noun_data,region=="Motor"))
+prefrontal <- droplevels(subset(noun_data,region=="Prefrontal"))
+motor.left <- as_tibble(subsets_by_region_hemisphere[["Motor.left"]])
+motor.right <- as_tibble(subsets_by_region_hemisphere[["Motor.right"]])
+```
+Bilateral plotting - eyeballing artifacts. I plot regions and approximate the channel correlation visually
+```{r , results = 'hide'}
+prefrontal_plot <- plot_avg_by_channel(prefrontal, c(-3,3))
+prefrontal_plot
+```
+The eye-tracking glasses may affect these channels below, there is pressure => muscle response
+ or some maybe affected by head movements. you can also plot selected channels 
+```{r , results = 'hide'}
+Ftemporal_plot <- plot_avg_by_channel(subset(noun_data, channel %in% c(c("T7", "T8","FT7", "FT8",  "TP7", "TP8", "TP9", "TP10", "FTT7h", "FTT8h", "FTT9h", "FTT10h"))), c(-1.5,1.5),"Front temporal")
+Ftemporal_plot 
+Ftemporal_channels <- plot_channels(subset(noun_data, channel %in% c(c("FTT9h", "FTT10h"))), c(-2.5,2.5),"Front temporal channels")
+Ftemporal_channels
+```
+
+channels beautifully unify at the p300
+```{r , results = 'hide'}
+MLchannels <- plot_channels(motor.left, c(-2.5,2.5), "Motor left channels")
+MLchannels
+MRchannels <- plot_channels(motor.right, c(-2.5,2.5), "Motor right channels")
+MRchannels
+```
+# ANALYSIS
+Here I do not take the data before the onset in the analysis, although, I would totally do it the Philip Alday way and use it instead of the baseline correction,but about these data I don't know if it had correction.
+First prepare data for the analysis, filter out the data before the onset, set the condition to ordered factor, as GAM will center it if we don't do it. Make an interaction of condition and FTF_fact, as manually coded interactions provide better deviance explained. 
+```{r}
+noun_data_analysis <- noun_data %>%filter(time > 0) 
+noun_data_analysis$condition = as.ordered(noun_data_analysis$condition)
+noun_data_analysis$interCondFTF <- interaction(noun_data_analysis$condition, noun_data_analysis$FTF_fact)
+noun_data_analysis$interCondFTF = as.ordered(noun_data_analysis$interCondFTF)
+```
+This is the function, that builds the modls,saves it and plots it. The summary of the model is also saved into a text file. The autoregression is commented out, as it did not improve the model with the oscillation perion put to the whole trial as some people do or to the residual autcorrelation peaks. I did not try it with lag = 1 though, as some other papers suggest.
+The model family is very important, k might be less, but this is only important for the computation time, unneeded wiliness is penalized anyway
+Basis function for the main effect is set to cubic regression as the signal is rather curvy,  however in this study they suggest thin plat:
+[Generalized additive mixed modeling of EEG supports dual-route accounts of morphosyntax in suggesting no word frequency effects on processing of regular grammatical forms](
+https://www.sciencedirect.com/science/article/pii/S0911604423000143?casa_token=SIDb-9Cn1oEAAAAA:NIwnvMEd9qqjHeOphx3_lm__MJcYqh7cas2SlIZ7Uj_Nz8wc01MmIPu4zP4ufdYPDkrL4j6I#fig1)
+```{r}
+gam_nouns_by_region_hemisphere <- function(noun_data){ 
+  region = paste(noun_data$region[1], noun_data$hemisphere[1], sep = " ")
+  model_nouns <- bam(data ~  interCondFTF +
+                        s(time, by = interCondFTF, k=100, bs="cr") +
+                       s(subject, bs="re") +
+                      s(time, subject,  by=interCondFTF, bs="fs", m=1) ,
+                      #rho=0.9, AR.start = noun_data$start.osc, AR.order = 1,
+                 data=noun_data, family = "scat", discrete = T, method = "fREML")
+
+  # letters RE in the file names mean 'random effect'
+  # FS means 'factor smooth'
+save(model_nouns, file = paste("models/nouns/reannotated/gam_factor_REFS", region, ".RData",  sep=""))
+jpeg(paste("plots/nouns/reannotated/gam_factor_REFS", region, ".jpeg", sep=""), units='cm', width=16, height=10, res=300)
+par(mfrow=c(1,2))
+plot_smooth(model_nouns, view='time', rug=F, plot_all = "interCondFTF")
+dev.off()
+model_summary <- capture.output(summary(model_nouns))
+output_file <- paste("summaries/nouns/reannotated/gam_factor_REFS", region, ".txt", sep="")
+writeLines(model_summary, con = output_file)
+}
+```
+Split the data into subsets by region and hemisphere
+```{r}
+subsets_by_region_hemisphere <- split(noun_data_analysis, list(noun_data_analysis$region, noun_data_analysis$hemisphere))
+```
+Use this line if you'd like build models for all the subsets
+```{r, eval = FALSE}
+lapply(subsets_by_region_hemisphere, gam_nouns_by_region_hemisphere)
+```
+Model selected subsets
+```{r, eval = FALSE}
+motor.left <- as_tibble(subsets_by_region_hemisphere[["Motor.left"]])
+gam_nouns_by_region_hemisphere(motor.left)
+```
+Load the model.when it is ready. Once loaded, it will always have a name 'model_nouns' as in the function
+```{r, include = FALSE}
+load("~/Desktop/R projects/EEG GAMMs/models/nouns/reannotated/gam_factor_REFSMotor left.RData")
+motor.left_gam <- model_nouns
+```
+```{r, eval = FALSE}
+load("~/PATH TO YOUR FOLDER/gam_factor_REFSMotor left.RData")
+motor.left_gam <- model_nouns
+```
+Check the model parameters. Here we can seeno patterns in residual distribution, the distribution is normal and has no heavy tails - this is a good model.
+The deviance explained is 37%
+```{r , results = 'hide'}
+gam.check(motor.left_gam)
+```
+Plot smooths
+```{r , results = 'hide'}
+par(mfrow=c(3,3))
+plot(motor.left_gam)
+```
+Check the residual autocorrelation
+```{r}
+acf_resid <- acf(residuals(motor.left_gam))
+estimated_rho <- acf_resid$acf[2]
+```
+
+# Plotting models
+Plot all differences and save all plots in one file, you can plot selected differences too - the significant periods will be given in summary.
+```{r}
+plot_diff(motor.left_gam, "time", comp=list(interCondFTF=c("no-conflict.>0.5<1","conflict.>0.5<1")), main="Motor Left, no-conflict, FTF > 0.5 < 1 
+          vs conflict, FTF > 0.5 < 1")
+```
+Here the summaries are written to the .txt filesby the plot_interaction_diff function from my plotting functions file.
+```{r eval = FALSE}
+interaction_pairs = apply(combn(levels(noun_data_analysis$interCondFTF),2),2, c)
+jpeg('plots/nouns/reannotated/MOT_leftREFS_differences_all_conditions.jpeg', units='cm', width=56, height=32, res=300)
+par(mfrow=c(7,4))
+apply(interaction_pairs, 2, plot_interaction_diff, model = motor.left_gam , picture = "gam_testinterCondFTFMEmotor left")
+dev.off()
+```
+# Data plotting to files
+```{r eval = FALSE}
+motor_left_plot <- plot_avg_by_channel(motor.left, c(-1.5,1.5), "Motor left")
+motor_right_plot <- plot_avg_by_channel(motor.right, c(-1.5,1.5), "Motor right")
+
+jpeg('plots/nouns/MOTOR left.jpeg', units='cm', width=56, height=32, res=300)
+motor_left_plot
+dev.off()
+jpeg('plots/nouns/MOTOR right.jpeg', units='cm', width=56, height=32, res=300)
+motor_right_plot
+dev.off()
+
